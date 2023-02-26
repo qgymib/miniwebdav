@@ -17,15 +17,28 @@
 #   define sscanf(b, f, ...)    sscanf_s(b, f, ##__VA_ARGS__)
 #endif
 
+typedef struct ev_http_send_token
+{
+    ev_tcp_write_req_t  token;
+    ev_http_conn_t*     conn;
+    size_t              size;
+
+#if defined(_MSC_VER)
+#   pragma warning(push)
+#   pragma warning(disable : 4200)
+#endif
+    unsigned char       data[];
+#if defined(_MSC_VER)
+#   pragma warning(pop)
+#endif
+} ev_http_send_token_t;
+
 struct ev_http_conn_s
 {
     ev_list_node_t      node;                       /**< Node for #ev_http_t::client_table */
 
     ev_http_t*          belong;                     /**< HTTP instance. */
     ev_tcp_t            client_sock;                /**< Client socket. */
-
-    ev_tcp_write_req_t  send_req;                   /**< Send request token. */
-    char                send_buf[EV_HTTP_IO_SIZE];  /**< Send buffer */
 
     ev_tcp_read_req_t   recv_req;                   /**< Recv request token. */
     char                recv_buf[EV_HTTP_IO_SIZE];  /**< Recv buffer */
@@ -541,4 +554,48 @@ int ev_http_listen(ev_http_t* http, const char* url, ev_http_cb cb, void* arg)
     http->evt_arg = arg;
 
     return _ev_http_try_accept(http, NULL);
+}
+
+int ev_http_close(ev_http_conn_t* conn)
+{
+    _ev_http_close_connection(conn, 1);
+    return 0;
+}
+
+static void _ev_http_on_send(ev_tcp_write_req_t* req, size_t size, int stat)
+{
+    (void)size;
+    ev_http_send_token_t* token = EV_CONTAINER_OF(req, ev_http_send_token_t, token);
+    ev_http_conn_t* conn = token->conn;
+
+    free(token);
+
+    if (stat != 0)
+    {
+        _ev_http_close_connection(conn, 1);
+    }
+}
+
+int ev_http_send(ev_http_conn_t* conn, const void* data, size_t size)
+{
+    size_t malloc_size = sizeof(ev_http_send_token_t) + size;
+    ev_http_send_token_t* token = malloc(malloc_size);
+    if (token == NULL)
+    {
+        return EV_ENOMEM;
+    }
+
+    memcpy(token->data, data, size);
+    token->size = size;
+    token->conn = conn;
+
+    ev_buf_t buf = ev_buf_make(token->data, token->size);
+    int ret = ev_tcp_write(&conn->client_sock, &token->token, &buf, 1, _ev_http_on_send);
+    if (ret != 0)
+    {
+        free(token);
+        return ret;
+    }
+
+    return 0;
 }

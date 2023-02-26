@@ -99,6 +99,22 @@ void ev_http_exit(ev_http_t* http, ev_http_close_cb cb);
  */
 int ev_http_listen(ev_http_t* http, const char* url, ev_http_cb cb, void* arg);
 
+/**
+ * @brief Close HTTP connection.
+ * @param[in] conn  HTTP connection.
+ * @return          UV error code.
+ */
+int ev_http_close(ev_http_conn_t* conn);
+
+/**
+ * @brief Send data on http connection.
+ * @param[in] conn  HTTP connection.
+ * @param[in] data  Data.
+ * @param[in] size  Data size.
+ * @return          UV error code.
+ */
+int ev_http_send(ev_http_conn_t* conn, const void* data, size_t size);
+
 #ifdef __cplusplus
 }
 #endif
