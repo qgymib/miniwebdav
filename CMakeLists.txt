@@ -18,6 +18,7 @@ endfunction()
 ###############################################################################
 
 add_executable(${PROJECT_NAME}
+    "src/http/ev-http.c"
     "src/main.c")
 
 target_include_directories(${PROJECT_NAME}
