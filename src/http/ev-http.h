@@ -80,11 +80,13 @@ typedef struct ev_http_fs
      * @brief Stat path.
      * @param[in] self      This object.
      * @param[in] path      Path to file or directory.
+     * @param[out] attr     Bit-OR of #ev_http_fs_flag_t.
      * @param[out] size     Size of file or directory.
      * @param[out] mtime    Modify time.
-     * @return              Bit-OR of #ev_http_fs_flag_t.
+     * @return              #ev_errno_t.
      */
-    int (*stat)(struct ev_http_fs* self, const char* path, size_t* size, time_t* mtime);
+    int (*stat)(struct ev_http_fs* self, const char* path, int* attr,
+        size_t* size, time_t* mtime);
 
     /**
      * @brief List file and directory in \p path.
@@ -98,11 +100,12 @@ typedef struct ev_http_fs
     /**
      * @brief Open file.
      * @param[in] self      This object.
+     * @param[out] fd       File descriptor.
      * @param[in] path      File path.
      * @param[in] flags     Bit-OR of #ev_http_fs_flag_t.
-     * @return              File handle.
+     * @return              #ev_errno_t.
      */
-    void* (*open)(struct ev_http_fs* self, const char* path, int flags);
+    void* (*open)(struct ev_http_fs* self, void** fd, const char* path, int flags);
 
     /**
      * @brief Close file.
@@ -203,6 +206,18 @@ int ev_http_close(ev_http_conn_t* conn);
  * @return          Field value.
  */
 ev_http_str_t* ev_http_get_header(ev_http_message_t* msg, const char* name);
+
+/**
+ * @brief Send HTTP response.
+ * @param[in] conn          HTTP connection.
+ * @param[in] status_code   HTTP response code.
+ * @param[in] headers       Extra headers. If not NULL, must end with `\r\n`.
+ * @param[in] body_fmt      Body format.
+ * @param[in] ...           Body format argument list.
+ * @return                  UV error code.
+ */
+int ev_http_reply(ev_http_conn_t* conn, int status_code,
+    const char* headers, const char* body_fmt, ...);
 
 /**
  * @brief Send data on http connection.

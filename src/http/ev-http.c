@@ -14,9 +14,22 @@
     (((uintptr_t)(size) + ((uintptr_t)(align) - 1)) & ~((uintptr_t)(align) - 1))
 
 /**
+ * @brief Get array size.
+ * @param[in] x The array
+ * @return      The size.
+ */
+#define ARRAY_SIZE(x)   (sizeof(x) / sizeof((x)[0]))
+
+/**
  * @brief Static initializer for #ev_http_str_t.
  */
 #define EV_HTTP_STR_INIT    { NULL, 0, 0 }
+
+/**
+ * @brief Declare a constant string.
+ * @param[in] x     Constant c string.
+ */
+#define EV_HTTP_CSTR(x) { x, sizeof(x) - 1, 0 }
 
 #if defined(_WIN32)
 #   define sscanf(b, f, ...)        sscanf_s(b, f, ##__VA_ARGS__)
@@ -37,6 +50,8 @@ typedef struct ev_http_send_token
 
 typedef struct ev_http_serve_token
 {
+    ev_threadpool_work_t        token;
+
     ev_http_str_t               method;         /**< METHOD. No need to free. */
     ev_http_str_t               url;            /**< URL. No need to free. */
     ev_http_str_t               root_path;      /**< Root path. No need to free. */
@@ -50,6 +65,9 @@ typedef struct ev_http_serve_token
 
     void*                       fd;             /**< File descriptor. */
     size_t                      remain_size;    /**< How many bytes remain to send. */
+
+    ev_http_str_t               rsp;            /**< Response data. */
+    int                         errcode;        /**< Error code. */
 } ev_http_serve_token_t;
 
 typedef struct ev_http_conn_action
@@ -128,6 +146,59 @@ static int s_uv_http_str_ensure_size(ev_http_str_t* str, size_t size)
     str->ptr = new_ptr;
     str->cap = new_cap_plus_one - 1;
     return 0;
+}
+
+static int s_uv_http_str_split(const ev_http_str_t* str, ev_http_str_t* k,
+    ev_http_str_t* v, const char* s, size_t offset)
+{
+    size_t i;
+    size_t s_len = strlen(s);
+    if (str->len < s_len)
+    {
+        goto error;
+    }
+
+    for (i = offset; i < str->len - s_len + 1; i++)
+    {
+        if (memcmp(str->ptr + i, s, s_len) == 0)
+        {
+            if (k != NULL)
+            {
+                k->ptr = str->ptr;
+                k->len = i;
+                k->cap = 0;
+            }
+
+            if (v != NULL)
+            {
+                v->ptr = str->ptr + i + s_len;
+                v->len = str->len - i - s_len;
+                v->cap = 0;
+            }
+
+            return 0;
+        }
+    }
+
+error:
+    return EV_ENOENT;
+}
+
+/**
+ * @brief Check if \p str end with \p pat.
+ * @param[in] str   The string to check.
+ * @param[in] pat   The pattern.
+ * @return          boolean.
+ */
+static int s_uv_http_str_end_with(const ev_http_str_t* str, const ev_http_str_t* pat)
+{
+    if (str->len < pat->len)
+    {
+        return 0;
+    }
+
+    size_t pos = str->len - pat->len;
+    return memcmp(str->ptr + pos, pat->ptr, pat->len) == 0;
 }
 
 static int s_uv_http_str_vprintf(ev_http_str_t* str, const char* fmt, va_list ap)
@@ -794,10 +865,26 @@ ev_http_str_t* ev_http_get_header(ev_http_message_t* msg, const char* name)
     return NULL;
 }
 
+static int _ev_http_action_conn_send(ev_http_conn_t* conn, ev_http_conn_action_t* action)
+{
+    ev_buf_t buf = ev_buf_make(action->as.send.data.ptr, action->as.send.data.len);
+    int ret = ev_tcp_write(&conn->client_sock, &action->as.send.token, &buf, 1, _ev_http_on_send);
+    ev_list_erase(&conn->send_queue, &action->node);
+
+    return ret;
+}
+
 static int s_uv_http_parse_range(const ev_http_str_t* str, size_t size,
     size_t* beg, size_t* end)
 {
     unsigned long long a, b;
+    if (str->len == 0)
+    {
+        *beg = 0;
+        *end = size > 0 ? size - 1 : 0;
+        return 0;
+    }
+
     if (str->len < 6 || memcmp(str->ptr, "bytes=", 6) != 0)
     {
         return EV_ENOENT;
@@ -858,20 +945,268 @@ static int s_uv_http_parse_range(const ev_http_str_t* str, size_t size,
     return 0;
 }
 
-static int _ev_http_action_conn_send(ev_http_conn_t* conn, ev_http_conn_action_t* action)
+static int s_uv_http_gen_reply_v(ev_http_str_t* str, int status_code,
+    const char* headers, const char* body_fmt, va_list ap)
 {
-    ev_buf_t buf = ev_buf_make(action->as.send.data.ptr, action->as.send.data.len);
-    int ret = ev_tcp_write(&conn->client_sock, &action->as.send.token, &buf, 1, _ev_http_on_send);
-    ev_list_erase(&conn->send_queue, &action->node);
+    int ret;
+    headers = headers != NULL ? headers : "";
+    body_fmt = body_fmt != NULL ? body_fmt : "";
+    const char* status_code_str = s_uv_http_status_code_str(status_code);
+
+    ret = s_uv_http_str_printf(str, "HTTP/1.1 %d %s\r\n%sContent-Length:           \r\n\r\n",
+        status_code, status_code_str, headers);
+    if (ret < 0)
+    {
+        return ret;
+    }
+    size_t pos = str->len;
+
+    if ((ret = s_uv_http_str_vprintf(str, body_fmt, ap)) < 0)
+    {
+        return ret;
+    }
+    snprintf(str->ptr + pos - 14, 11, "%010d", ret);
+    str->ptr[pos - 4] = '\r';
+
+    return 0;
+}
+
+static int s_uv_http_gen_reply(ev_http_str_t* str, int status_code,
+    const char* headers, const char* body_fmt, ...)
+{
+    int ret;
+
+    va_list ap;
+    va_start(ap, body_fmt);
+    ret = s_uv_http_gen_reply_v(str, status_code, headers, body_fmt, ap);
+    va_end(ap);
 
     return ret;
+}
+
+static const char* _ev_http_status_code_str(int status_code)
+{
+    switch (status_code)
+    {
+    case 100: return "Continue";
+    case 201: return "Created";
+    case 202: return "Accepted";
+    case 204: return "No Content";
+    case 206: return "Partial Content";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 304: return "Not Modified";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 416: return "Range Not Satisfiable";
+    case 418: return "I'm a teapot";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    default:  return "OK";
+    }
+}
+
+static int s_uv_http_guess_content_type_from_mime(const ev_http_str_t* path,
+    const ev_http_str_t* mime, ev_http_str_t* dst)
+{
+    int ret = 0;
+    ev_http_str_t mime_bak = *mime;
+
+    while (ret == 0)
+    {
+        ev_http_str_t k, v;
+        if ((ret = s_uv_http_str_split(&mime_bak, &k, &v, "=", 0)) != 0)
+        {
+            return ret;
+        }
+
+        ret = s_uv_http_str_split(&v, &v, &mime_bak, ",", 0);
+
+        if (s_uv_http_str_end_with(path, &k))
+        {
+            *dst = v;
+            return 0;
+        }
+    }
+
+    return EV_ENOENT;
+}
+
+static void s_uv_http_guess_content_type(const ev_http_str_t* path,
+    const ev_http_str_t* mime, ev_http_str_t* dst)
+{
+    static ev_http_header_t s_known_types[] = {
+        { EV_HTTP_CSTR(".html"),     EV_HTTP_CSTR("text/html; charset=utf-8") },
+        { EV_HTTP_CSTR(".htm"),      EV_HTTP_CSTR("text/html; charset=utf-8") },
+        { EV_HTTP_CSTR(".css"),      EV_HTTP_CSTR("text/css; charset=utf-8") },
+        { EV_HTTP_CSTR(".js"),       EV_HTTP_CSTR("text/javascript; charset=utf-8") },
+        { EV_HTTP_CSTR(".gif"),      EV_HTTP_CSTR("image/gif") },
+        { EV_HTTP_CSTR(".png"),      EV_HTTP_CSTR("image/png") },
+        { EV_HTTP_CSTR(".jpg"),      EV_HTTP_CSTR("image/jpeg") },
+        { EV_HTTP_CSTR(".jpeg"),     EV_HTTP_CSTR("image/jpeg") },
+        { EV_HTTP_CSTR(".woff"),     EV_HTTP_CSTR("font/woff") },
+        { EV_HTTP_CSTR(".ttf"),      EV_HTTP_CSTR("font/ttf") },
+        { EV_HTTP_CSTR(".svg"),      EV_HTTP_CSTR("image/svg+xml") },
+        { EV_HTTP_CSTR(".txt"),      EV_HTTP_CSTR("text/plain; charset=utf-8") },
+        { EV_HTTP_CSTR(".avi"),      EV_HTTP_CSTR("video/x-msvideo") },
+        { EV_HTTP_CSTR(".csv"),      EV_HTTP_CSTR("text/csv") },
+        { EV_HTTP_CSTR(".doc"),      EV_HTTP_CSTR("application/msword") },
+        { EV_HTTP_CSTR(".exe"),      EV_HTTP_CSTR("application/octet-stream") },
+        { EV_HTTP_CSTR(".gz"),       EV_HTTP_CSTR("application/gzip") },
+        { EV_HTTP_CSTR(".ico"),      EV_HTTP_CSTR("image/x-icon") },
+        { EV_HTTP_CSTR(".json"),     EV_HTTP_CSTR("application/json") },
+        { EV_HTTP_CSTR(".mov"),      EV_HTTP_CSTR("video/quicktime") },
+        { EV_HTTP_CSTR(".mp3"),      EV_HTTP_CSTR("audio/mpeg") },
+        { EV_HTTP_CSTR(".mp4"),      EV_HTTP_CSTR("video/mp4") },
+        { EV_HTTP_CSTR(".mpeg"),     EV_HTTP_CSTR("video/mpeg") },
+        { EV_HTTP_CSTR(".pdf"),      EV_HTTP_CSTR("application/pdf") },
+        { EV_HTTP_CSTR(".shtml"),    EV_HTTP_CSTR("text/html; charset=utf-8") },
+        { EV_HTTP_CSTR(".tgz"),      EV_HTTP_CSTR("application/tar-gz") },
+        { EV_HTTP_CSTR(".wav"),      EV_HTTP_CSTR("audio/wav") },
+        { EV_HTTP_CSTR(".webp"),     EV_HTTP_CSTR("image/webp") },
+        { EV_HTTP_CSTR(".zip"),      EV_HTTP_CSTR("application/zip") },
+        { EV_HTTP_CSTR(".3gp"),      EV_HTTP_CSTR("video/3gpp") },
+    };
+
+    /* First try user provide mime. */
+    if (s_uv_http_guess_content_type_from_mime(path, mime, dst) == 0)
+    {
+        return;
+    }
+
+    /* Try to match predefined mime. */
+    size_t i;
+    for (i = 0; i < ARRAY_SIZE(s_known_types); i++)
+    {
+        ev_http_header_t* rec = &s_known_types[i];
+        if (s_uv_http_str_end_with(path, &rec->name))
+        {
+            *dst = rec->value;
+            return;
+        }
+    }
+
+    *dst = (ev_http_str_t)EV_HTTP_CSTR("application/octet-stream");
+    return;
+}
+
+static int _ev_http_action_serve_file(ev_http_serve_token_t* serve, const ev_http_str_t* path)
+{
+    int ret;
+    int status_code;
+    char etag[64]; char range[128];
+    ev_http_fs_t* fs = serve->fs;
+
+    int attr; size_t size; time_t mtime;
+    if ((ret = fs->stat(fs, path->ptr, &attr, &size, &mtime)) != 0)
+    {
+        return ret;
+    }
+
+    /* Check etag. */
+    snprintf(etag, sizeof(etag), "\"%lld.%zu\"", (long long)mtime, size);
+    if (strcasecmp(etag, serve->if_none_match.ptr) == 0)
+    {
+        serve->errcode = s_uv_http_gen_reply(&serve->rsp, 304, serve->extra_headers.ptr, NULL);
+        return 0;
+    }
+
+    /* Get mime. */
+    ev_http_str_t mime = EV_HTTP_STR_INIT;
+    s_uv_http_guess_content_type(path, &serve->mime_types, &mime);
+
+    /* Get range. */
+    size_t beg, end;
+    if ((ret = s_uv_http_parse_range(&serve->range, size, &beg, &end)) != 0)
+    {
+        status_code = 416;
+        const char* status_code_str = _ev_http_status_code_str(status_code);
+        ret = s_uv_http_str_printf(&serve->rsp,
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %.*s\r\n"
+            "ETag: %s\r\n"
+            "Content-Range: bytes */%zu\r\n"
+            "%.*s"
+            "\r\n",
+            status_code, status_code_str,
+            (int)mime.len, mime.ptr,
+            etag,
+            size,
+            serve->extra_headers.len, serve->extra_headers.ptr);
+        return ret;
+    }
+    snprintf(range, sizeof(range), "Content-Range: bytes %zu-%zu/%zu\r\n", beg, end, size);
+
+    /* Generate response. */
+    status_code = 200;
+    ret = s_uv_http_str_printf(&serve->rsp,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %.*s\r\n"
+        "Etag: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "%s"
+        "%.*s"
+        "\r\n",
+        status_code, _ev_http_status_code_str(status_code),
+        (int)mime.len, mime.ptr,
+        etag,
+        size,
+        range,
+        (int)serve->extra_headers.len, serve->extra_headers.ptr);
+    if (ret != 0)
+    {
+        return ret;
+    }
+
+    /* No need to read file if it is a HEAD request */
+    if (strcmp(serve->method.ptr, "HEAD") == 0)
+    {
+        return 0;
+    }
+
+    /* Open file. */
+    if ((ret = fs->open(fs, &serve->fd, serve->root_path.ptr, EV_HTTP_FS_READ)) != 0)
+    {
+        return ret;
+    }
+    if ((ret = fs->seek(fs, serve->fd, beg)) != 0)
+    {
+        return ret;
+    }
+
+
+}
+
+static void _ev_http_action_conn_server_on_work(ev_threadpool_work_t* work)
+{
+
+    int ret;
+    ev_http_conn_action_t* action = EV_CONTAINER_OF(work, ev_http_conn_action_t, as.serve.token);
+    ev_http_serve_token_t* serve = &action->as.serve;
+    
+    if ((ret = _ev_http_action_serve_file(serve, &serve->root_path)) == 0)
+    {
+        return;
+    }
+
+    serve->errcode = _ev_http_action_serve_file(serve, &serve->page404);
+}
+
+static void _ev_http_action_conn_serve_on_work_done(ev_threadpool_work_t* work, int status)
+{
+    ev_http_conn_action_t* action = EV_CONTAINER_OF(work, ev_http_conn_action_t, as.serve.token);
 }
 
 static int _ev_http_action_conn_serve(ev_http_conn_t* conn, ev_http_conn_action_t* action)
 {
     ev_http_serve_token_t* serve = &action->as.serve;
+    ev_http_t* http = conn->belong;
 
-    
+    int ret = ev_loop_queue_work(http->loop, &action->as.serve.token,
+        _ev_http_action_conn_server_on_work,
+        _ev_http_action_conn_serve_on_work_done);
 }
 
 static int _ev_http_action_connection(ev_http_conn_t* conn)
