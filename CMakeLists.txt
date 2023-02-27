@@ -25,7 +25,7 @@ target_include_directories(${PROJECT_NAME}
     PUBLIC
         $<INSTALL_INTERFACE:include>
     PRIVATE
-        ${LLHTTP_ROOT}/src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 setup_target_wall(${PROJECT_NAME})
 
